@@ -1,0 +1,4 @@
+cffi>=1.15
+numpy>=2.0,<3
+textual>=8
+bladerf @ git+https://github.com/Nuand/bladeRF.git@2023.02#subdirectory=host/libraries/libbladeRF_bindings/python
