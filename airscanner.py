@@ -30,10 +30,12 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
+import scipy.fft
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.message import Message
 from textual.widgets import DataTable, Footer, Header, Input, Static
 
 from bladerf import _bladerf as brf
@@ -592,7 +594,7 @@ class Listener:
 def process_hop(iq, hop, nfft, window, threshold):
     k = iq.size // nfft
     segs = iq[:k * nfft].reshape(k, nfft) * window
-    spec = np.fft.fft(segs, axis=1)
+    spec = scipy.fft.fft(segs, axis=1, workers=-1)
     psd = np.fft.fftshift((spec.real ** 2 + spec.imag ** 2).mean(axis=0))
     kept = psd[hop.keep]
     floor = max(float(np.median(kept)), 1e-30)
@@ -722,6 +724,19 @@ def fmt_duration(seconds):
     return f"{s // 3600}h{(s % 3600) // 60:02d}m"
 
 
+class RowsUpdate(Message):
+    """Snapshot of channel rows from the sweep thread.
+
+    Posted fire-and-forget so the sweep loop never waits on rendering; the
+    _ui_busy flag keeps at most one in flight (skipped sweeps lose nothing,
+    rows are cumulative stats).
+    """
+
+    def __init__(self, rows, now, sweep_text):
+        super().__init__()
+        self.rows, self.now, self.sweep_text = rows, now, sweep_text
+
+
 class Cell(Text):
     """Table cell with a numeric sort value alongside its rendered text."""
 
@@ -765,6 +780,7 @@ class ScannerApp(App):
         self.threshold = cfg.threshold
         self.min_activity = cfg.activity
         self.paused = threading.Event()
+        self._ui_busy = threading.Event()
         self.stop = threading.Event()
         self.done = threading.Event()  # set once the worker released the radio
         self.reset_requested = False
@@ -960,6 +976,12 @@ class ScannerApp(App):
             parts.append("PAUSED")
         self.query_one("#status", Static).update(" | ".join(parts))
 
+    def on_rows_update(self, message):
+        try:
+            self.update_rows(message.rows, message.now, message.sweep_text)
+        finally:
+            self._ui_busy.clear()
+
     def update_rows(self, rows, now, sweep_text):
         self._last_rows, self._last_now = rows, now
         table = self.query_one(DataTable)
@@ -988,6 +1010,48 @@ class ScannerApp(App):
         self._refresh_status(sweep_text)
 
     # --- sweep loop (worker thread) -------------------------------------
+
+    def _capture_loop(self, radio, plan, n_samps, q, cap_stop):
+        """Producer: all radio I/O on a dedicated thread, so processing one
+        dwell overlaps the tune+capture of the next (sync_rx and the FFT both
+        release the GIL). On a radio error, records it and enqueues a None
+        sentinel for the consumer.
+        """
+        def stopping():
+            return self.stop.is_set() or cap_stop.is_set()
+
+        def put(item):
+            while not stopping():
+                try:
+                    q.put(item, timeout=0.5)
+                    return
+                except queue.Full:
+                    pass
+
+        sweep = 0
+        current_freq = None
+        try:
+            while not stopping():
+                if self.paused.is_set():
+                    time.sleep(0.1)
+                    continue
+                hops = plan.phases[sweep % 2]
+                for i, hop in enumerate(hops):
+                    if stopping():
+                        return
+                    if hop.center != current_freq:
+                        radio.tune(hop.center)
+                        current_freq = hop.center
+                    iq = radio.capture(n_samps)
+                    now = time.monotonic()
+                    last = i == len(hops) - 1
+                    gain_now = (radio.current_gain()
+                                if last and self.cfg.gain is None else None)
+                    put((hop, iq, now, last, gain_now))
+                sweep += 1
+        except brf.BladeRFError as e:
+            self._radio_error = e
+            put(None)
 
     @work(thread=True, exclusive=True)
     def scan(self):
@@ -1056,39 +1120,49 @@ class ScannerApp(App):
             shown_gain = None
             call(self.set_info, info_text(None))
 
+            q = queue.Queue(maxsize=2)  # dwells in flight; bounded for backpressure
+            cap_stop = threading.Event()
+            self._radio_error = None
+            cap = threading.Thread(target=self._capture_loop,
+                                   args=(radio, plan, n_samps, q, cap_stop),
+                                   daemon=True)
+            cap.start()
             sweep = 0
             sweep_times = deque(maxlen=20)
-            current_freq = None
-            while not self.stop.is_set():
-                if self.paused.is_set():
-                    time.sleep(0.1)
-                    continue
-                if self.reset_requested:
-                    self.reset_requested = False
-                    stats = ChannelStats(cfg.spacing, cfg.window, cfg.max_width)
-                for hop in plan.phases[sweep % 2]:
-                    if self.stop.is_set():
-                        return
-                    if hop.center != current_freq:
-                        radio.tune(hop.center)
-                        current_freq = hop.center
-                    iq = radio.capture(n_samps)
-                    now = time.monotonic()
+            try:
+                while not self.stop.is_set():
+                    try:
+                        item = q.get(timeout=0.5)
+                    except queue.Empty:
+                        continue
+                    if item is None:
+                        raise self._radio_error  # the capture thread died on this
+                    hop, iq, now, end_of_sweep, gain_now = item
+                    if self.reset_requested:
+                        self.reset_requested = False
+                        stats = ChannelStats(cfg.spacing, cfg.window, cfg.max_width)
                     idxs, dbs, hits, runs = process_hop(iq, hop, nfft, fft_window,
                                                         self.threshold)
                     stats.update(idxs, dbs, hits, runs, now)
-                sweep += 1
-                now = time.monotonic()
-                sweep_times.append(now)
-                rate = ((len(sweep_times) - 1) / (sweep_times[-1] - sweep_times[0])
-                        if len(sweep_times) > 1 else 0.0)
-                rows = stats.rows(now, self.min_activity)
-                call(self.update_rows, rows, now, f"sweep {sweep} | {rate:.1f} sweeps/s")
-                if cfg.gain is None:
-                    gain_now = radio.current_gain()  # gain at the last hop of the sweep
-                    if gain_now != shown_gain:
+                    if not end_of_sweep:
+                        continue
+                    sweep += 1
+                    sweep_times.append(now)
+                    rate = ((len(sweep_times) - 1) / (sweep_times[-1] - sweep_times[0])
+                            if len(sweep_times) > 1 else 0.0)
+                    rows = stats.rows(now, self.min_activity)
+                    if not self._ui_busy.is_set():
+                        self._ui_busy.set()
+                        self.post_message(RowsUpdate(rows, now,
+                                                     f"sweep {sweep} | {rate:.1f} sweeps/s"))
+                    if cfg.gain is None and gain_now != shown_gain:
                         shown_gain = gain_now
                         call(self.set_info, info_text(gain_now))
+            finally:
+                # release the capture thread before closing the radio; a plain
+                # self.stop.set() would also mute the error exit path in call()
+                cap_stop.set()
+                cap.join(timeout=5)
         except brf.BladeRFError as e:
             call(self.exit, return_code=1, message=f"BladeRF error: {e}")
         finally:
